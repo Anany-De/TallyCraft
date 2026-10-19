@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Iterable
 
@@ -54,6 +54,41 @@ class JournalSummary:
     amount: Decimal
 
 
+@dataclass(frozen=True)
+class InventoryItem:
+    sku: str
+    name: str
+    unit: str
+    inventory_account_code: str
+    cogs_account_code: str
+    reorder_level: Decimal
+    quantity_on_hand: Decimal
+    carrying_value: Decimal
+
+
+@dataclass(frozen=True)
+class InventoryMovement:
+    id: int
+    journal_entry_id: int
+    entry_date: date
+    sku: str
+    item_name: str
+    movement_type: str
+    quantity: Decimal
+    value: Decimal
+    reference: str | None
+    memo: str
+
+
+@dataclass(frozen=True)
+class JournalLineDetail:
+    entry_id: int
+    line_number: int
+    account_code: str
+    debit: Decimal
+    credit: Decimal
+
+
 class Ledger:
     """Append-only journal with exact-cent amounts and a trial-balance report."""
 
@@ -86,8 +121,34 @@ class Ledger:
                    CHECK ((debit_minor > 0 AND credit_minor = 0) OR
                           (credit_minor > 0 AND debit_minor = 0))
                );
+               CREATE TABLE IF NOT EXISTS inventory_items (
+                   id INTEGER PRIMARY KEY,
+                   sku TEXT NOT NULL UNIQUE,
+                   name TEXT NOT NULL,
+                   unit TEXT NOT NULL,
+                   inventory_account_id INTEGER NOT NULL REFERENCES accounts(id),
+                   cogs_account_id INTEGER NOT NULL REFERENCES accounts(id),
+                   reorder_milli INTEGER NOT NULL DEFAULT 0 CHECK (reorder_milli >= 0),
+                   on_hand_milli INTEGER NOT NULL DEFAULT 0 CHECK (on_hand_milli >= 0),
+                   value_minor INTEGER NOT NULL DEFAULT 0 CHECK (value_minor >= 0),
+                   CHECK ((on_hand_milli = 0 AND value_minor = 0) OR on_hand_milli > 0)
+               );
+               CREATE TABLE IF NOT EXISTS inventory_movements (
+                   id INTEGER PRIMARY KEY,
+                   item_id INTEGER NOT NULL REFERENCES inventory_items(id),
+                   entry_id INTEGER NOT NULL UNIQUE REFERENCES journal_entries(id),
+                   movement_date TEXT NOT NULL,
+                   movement_type TEXT NOT NULL CHECK
+                       (movement_type IN ('receipt', 'issue')),
+                   quantity_milli INTEGER NOT NULL CHECK (quantity_milli > 0),
+                   value_minor INTEGER NOT NULL CHECK (value_minor > 0),
+                   reference TEXT,
+                   memo TEXT NOT NULL
+               );
                CREATE INDEX IF NOT EXISTS journal_entry_date_idx
                    ON journal_entries(entry_date, id);
+               CREATE INDEX IF NOT EXISTS inventory_movement_item_date_idx
+                   ON inventory_movements(item_id, movement_date, id);
                CREATE TRIGGER IF NOT EXISTS entries_immutable_update
                    BEFORE UPDATE ON journal_entries BEGIN
                        SELECT RAISE(ABORT, 'posted entries are immutable');
@@ -103,6 +164,14 @@ class Ledger:
                CREATE TRIGGER IF NOT EXISTS lines_immutable_delete
                    BEFORE DELETE ON journal_lines BEGIN
                        SELECT RAISE(ABORT, 'posted lines are immutable');
+                   END;
+               CREATE TRIGGER IF NOT EXISTS inventory_movements_immutable_update
+                   BEFORE UPDATE ON inventory_movements BEGIN
+                       SELECT RAISE(ABORT, 'posted inventory movements are immutable');
+                   END;
+               CREATE TRIGGER IF NOT EXISTS inventory_movements_immutable_delete
+                   BEFORE DELETE ON inventory_movements BEGIN
+                       SELECT RAISE(ABORT, 'posted inventory movements are immutable');
                    END;"""
         )
 
@@ -170,29 +239,302 @@ class Ledger:
         if debit_total != credit_total:
             raise AccountingError("Journal entry debits and credits must balance.")
         with self._db:
-            codes = {code for code, _, _ in normalized}
-            placeholders = ",".join("?" for _ in codes)
-            accounts = {
-                row["code"]: row["id"]
-                for row in self._db.execute(
-                    f"SELECT id,code FROM accounts WHERE code IN ({placeholders})", tuple(codes)
+            return self._post_entry_transaction(
+                posted_date, memo.strip(), reference.strip() if reference else None, normalized
+            )
+
+    def create_inventory_item(
+        self,
+        sku: str,
+        name: str,
+        unit: str,
+        inventory_account_code: str,
+        cogs_account_code: str,
+        reorder_level: Decimal | str | int = 0,
+    ) -> InventoryItem:
+        for value, label in ((sku, "SKU"), (name, "Item name"), (unit, "Unit")):
+            if not isinstance(value, str) or not value.strip():
+                raise AccountingError(f"{label} is required.")
+        reorder_milli = self._quantity_milli(reorder_level, allow_zero=True)
+        try:
+            with self._db:
+                accounts = {
+                    row["code"]: row
+                    for row in self._db.execute(
+                        "SELECT id, code, type FROM accounts WHERE code IN (?, ?)",
+                        (inventory_account_code, cogs_account_code),
+                    )
+                }
+                inventory_account = accounts.get(inventory_account_code)
+                cogs_account = accounts.get(cogs_account_code)
+                if inventory_account is None or inventory_account["type"] != AccountType.ASSET:
+                    raise AccountingError("Inventory control account must be an asset.")
+                if cogs_account is None or cogs_account["type"] != AccountType.EXPENSE:
+                    raise AccountingError("Cost of goods sold account must be an expense.")
+                if inventory_account_code == cogs_account_code:
+                    raise AccountingError("Inventory and cost accounts must be different.")
+                self._db.execute(
+                    """INSERT INTO inventory_items
+                       (sku, name, unit, inventory_account_id, cogs_account_id, reorder_milli)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        sku.strip(),
+                        name.strip(),
+                        unit.strip(),
+                        inventory_account["id"],
+                        cogs_account["id"],
+                        reorder_milli,
+                    ),
                 )
-            }
-            missing = sorted(codes - accounts.keys())
-            if missing:
-                raise AccountingError(f"Unknown account code(s): {', '.join(missing)}")
-            cursor = self._db.execute(
-                "INSERT INTO journal_entries(entry_date,memo,reference,created_at) VALUES(?,?,?,?)",
-                (posted_date.isoformat(), memo.strip(), reference.strip() if reference else None,
-                 datetime.now(timezone.utc).isoformat()),
+        except sqlite3.IntegrityError as error:
+            raise AccountingError(f"SKU already exists: {sku.strip()}") from error
+        item = next(item for item in self.list_inventory_items() if item.sku == sku.strip())
+        return item
+
+    def list_inventory_items(self) -> tuple[InventoryItem, ...]:
+        rows = self._db.execute(
+            """SELECT i.sku, i.name, i.unit, ia.code AS inventory_code,
+                      ca.code AS cogs_code, i.reorder_milli, i.on_hand_milli,
+                      i.value_minor
+               FROM inventory_items i
+               JOIN accounts ia ON ia.id = i.inventory_account_id
+               JOIN accounts ca ON ca.id = i.cogs_account_id
+               ORDER BY i.sku"""
+        )
+        return tuple(
+            InventoryItem(
+                row["sku"],
+                row["name"],
+                row["unit"],
+                row["inventory_code"],
+                row["cogs_code"],
+                self._quantity_decimal(row["reorder_milli"]),
+                self._quantity_decimal(row["on_hand_milli"]),
+                self._decimal(row["value_minor"]),
             )
-            entry_id = cursor.lastrowid
-            self._db.executemany(
-                "INSERT INTO journal_lines(entry_id,line_number,account_id,debit_minor,credit_minor) VALUES(?,?,?,?,?)",
-                [(entry_id, i, accounts[code], debit, credit)
-                 for i, (code, debit, credit) in enumerate(normalized, 1)],
+            for row in rows
+        )
+
+    def inventory_history(self, limit: int = 100) -> tuple[InventoryMovement, ...]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise AccountingError("History limit must be a positive integer.")
+        rows = self._db.execute(
+            """SELECT m.id, m.entry_id, m.movement_date, i.sku, i.name, m.movement_type,
+                      m.quantity_milli, m.value_minor, m.reference, m.memo
+               FROM inventory_movements m
+               JOIN inventory_items i ON i.id = m.item_id
+               ORDER BY m.movement_date DESC, m.id DESC
+               LIMIT ?""",
+            (limit,),
+        )
+        return tuple(
+            InventoryMovement(
+                row["id"],
+                row["entry_id"],
+                date.fromisoformat(row["movement_date"]),
+                row["sku"],
+                row["name"],
+                row["movement_type"],
+                self._quantity_decimal(row["quantity_milli"]),
+                self._decimal(row["value_minor"]),
+                row["reference"],
+                row["memo"],
             )
+            for row in rows
+        )
+
+    def receive_inventory(
+        self,
+        sku: str,
+        entry_date: date | str,
+        quantity: Decimal | str | int,
+        unit_cost: Decimal | str | int,
+        offset_account_code: str,
+        memo: str,
+        reference: str | None = None,
+    ) -> int:
+        posted_date = self._parse_date(entry_date)
+        quantity_milli = self._quantity_milli(quantity)
+        unit_cost_minor = self._minor(unit_cost)
+        receipt_value = self._round_ratio(quantity_milli * unit_cost_minor, 1000)
+        if receipt_value == 0:
+            raise AccountingError("Receipt total must be at least one cent.")
+        memo, reference = self._validate_inventory_description(memo, reference)
+        with self._db:
+            item = self._inventory_item_row(sku)
+            if offset_account_code == item["inventory_code"]:
+                raise AccountingError("Receipt offset must differ from inventory account.")
+            entry_id = self._post_entry_transaction(
+                posted_date,
+                memo,
+                reference,
+                [
+                    (item["inventory_code"], receipt_value, 0),
+                    (offset_account_code, 0, receipt_value),
+                ],
+            )
+            self._db.execute(
+                """UPDATE inventory_items
+                   SET on_hand_milli = on_hand_milli + ?, value_minor = value_minor + ?
+                   WHERE id = ?""",
+                (quantity_milli, receipt_value, item["id"]),
+            )
+            self._db.execute(
+                """INSERT INTO inventory_movements
+                   (item_id, entry_id, movement_date, movement_type, quantity_milli,
+                    value_minor, reference, memo)
+                   VALUES (?, ?, ?, 'receipt', ?, ?, ?, ?)""",
+                (
+                    item["id"], entry_id, posted_date.isoformat(), quantity_milli,
+                    receipt_value, reference, memo,
+                ),
+            )
+        return entry_id
+
+    def issue_inventory(
+        self,
+        sku: str,
+        entry_date: date | str,
+        quantity: Decimal | str | int,
+        memo: str,
+        reference: str | None = None,
+    ) -> int:
+        posted_date = self._parse_date(entry_date)
+        quantity_milli = self._quantity_milli(quantity)
+        memo, reference = self._validate_inventory_description(memo, reference)
+        with self._db:
+            item = self._inventory_item_row(sku)
+            on_hand = item["on_hand_milli"]
+            inventory_value = item["value_minor"]
+            if quantity_milli > on_hand:
+                raise AccountingError(
+                    f"Insufficient stock for {sku}: "
+                    f"{self._quantity_decimal(on_hand)} {item['unit']} available."
+                )
+            issue_value = (
+                inventory_value
+                if quantity_milli == on_hand
+                else self._round_ratio(inventory_value * quantity_milli, on_hand)
+            )
+            if issue_value == 0:
+                raise AccountingError("Issue value must be at least one cent.")
+            if quantity_milli < on_hand and issue_value >= inventory_value:
+                raise AccountingError(
+                    "This partial issue would consume all remaining value; issue all stock instead."
+                )
+            entry_id = self._post_entry_transaction(
+                posted_date,
+                memo,
+                reference,
+                [
+                    (item["cogs_code"], issue_value, 0),
+                    (item["inventory_code"], 0, issue_value),
+                ],
+            )
+            self._db.execute(
+                """UPDATE inventory_items
+                   SET on_hand_milli = on_hand_milli - ?, value_minor = value_minor - ?
+                   WHERE id = ?""",
+                (quantity_milli, issue_value, item["id"]),
+            )
+            self._db.execute(
+                """INSERT INTO inventory_movements
+                   (item_id, entry_id, movement_date, movement_type, quantity_milli,
+                    value_minor, reference, memo)
+                   VALUES (?, ?, ?, 'issue', ?, ?, ?, ?)""",
+                (
+                    item["id"], entry_id, posted_date.isoformat(), quantity_milli,
+                    issue_value, reference, memo,
+                ),
+            )
+        return entry_id
+
+    def _post_entry_transaction(
+        self,
+        posted_date: date,
+        memo: str,
+        reference: str | None,
+        normalized: list[tuple[str, int, int]],
+    ) -> int:
+        codes = {code for code, _, _ in normalized}
+        placeholders = ",".join("?" for _ in codes)
+        accounts = {
+            row["code"]: row["id"]
+            for row in self._db.execute(
+                f"SELECT id,code FROM accounts WHERE code IN ({placeholders})", tuple(codes)
+            )
+        }
+        missing = sorted(codes - accounts.keys())
+        if missing:
+            raise AccountingError(f"Unknown account code(s): {', '.join(missing)}")
+        cursor = self._db.execute(
+            "INSERT INTO journal_entries(entry_date,memo,reference,created_at) VALUES(?,?,?,?)",
+            (
+                posted_date.isoformat(), memo, reference,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        entry_id = cursor.lastrowid
+        self._db.executemany(
+            """INSERT INTO journal_lines
+               (entry_id,line_number,account_id,debit_minor,credit_minor)
+               VALUES(?,?,?,?,?)""",
+            [
+                (entry_id, i, accounts[code], debit, credit)
+                for i, (code, debit, credit) in enumerate(normalized, 1)
+            ],
+        )
         return int(entry_id)
+
+    def _inventory_item_row(self, sku: str) -> sqlite3.Row:
+        row = self._db.execute(
+            """SELECT i.id, i.sku, i.name, i.unit, i.on_hand_milli, i.value_minor,
+                      ia.code AS inventory_code, ca.code AS cogs_code
+               FROM inventory_items i
+               JOIN accounts ia ON ia.id = i.inventory_account_id
+               JOIN accounts ca ON ca.id = i.cogs_account_id
+               WHERE i.sku = ?""",
+            (sku,),
+        ).fetchone()
+        if row is None:
+            raise AccountingError(f"Unknown inventory SKU: {sku}")
+        return row
+
+    @staticmethod
+    def _validate_inventory_description(
+        memo: str, reference: str | None
+    ) -> tuple[str, str | None]:
+        if not isinstance(memo, str) or not memo.strip():
+            raise AccountingError("Inventory movement memo is required.")
+        if reference is not None and (
+            not isinstance(reference, str) or not reference.strip()
+        ):
+            raise AccountingError("Reference must be non-empty when provided.")
+        return memo.strip(), reference.strip() if reference else None
+
+    @staticmethod
+    def _quantity_milli(value: Decimal | str | int, allow_zero: bool = False) -> int:
+        if isinstance(value, (float, bool)):
+            raise AccountingError("Quantities must not be floats or booleans.")
+        try:
+            quantity = Decimal(value)
+        except (InvalidOperation, TypeError, ValueError) as error:
+            raise AccountingError("Quantity must be a valid decimal value.") from error
+        if not quantity.is_finite() or quantity < 0 or (quantity == 0 and not allow_zero):
+            raise AccountingError("Quantity must be positive.")
+        milli = quantity * 1000
+        if milli != milli.to_integral_value():
+            raise AccountingError("Quantities may have at most three decimal places.")
+        return int(milli)
+
+    @staticmethod
+    def _quantity_decimal(milli: int) -> Decimal:
+        return (Decimal(milli) / 1000).quantize(Decimal("0.001"))
+
+    @staticmethod
+    def _round_ratio(numerator: int, denominator: int) -> int:
+        return (2 * numerator + denominator) // (2 * denominator)
+
 
     def trial_balance(self, as_of: date | str) -> TrialBalance:
         cutoff = self._parse_date(as_of)
@@ -239,6 +581,36 @@ class Ledger:
             for row in rows
         )
 
+    def journal_line_details(self) -> tuple[JournalLineDetail, ...]:
+        rows = self._db.execute(
+            """SELECT je.id AS entry_id, jl.line_number, a.code,
+                      jl.debit_minor, jl.credit_minor
+               FROM journal_entries je
+               JOIN journal_lines jl ON jl.entry_id = je.id
+               JOIN accounts a ON a.id = jl.account_id
+               ORDER BY je.id, jl.line_number"""
+        )
+        return tuple(
+            JournalLineDetail(
+                row["entry_id"],
+                row["line_number"],
+                row["code"],
+                self._decimal(row["debit_minor"]),
+                self._decimal(row["credit_minor"]),
+            )
+            for row in rows
+        )
+
+    def export_excel(self, path: str | Path) -> None:
+        from .excel import export_workbook
+
+        export_workbook(self, path)
+
+    def import_excel(self, path: str | Path) -> int:
+        from .excel import import_workbook
+
+        return import_workbook(self, path)
+
     def verify_integrity(self) -> None:
         """Raise if SQLite structure or posted double-entry records are inconsistent."""
         result = self._db.execute("PRAGMA integrity_check").fetchone()[0]
@@ -265,6 +637,26 @@ class Ledger:
         if invalid_entry is not None:
             raise AccountingError(
                 f"Journal entry {invalid_entry['id']} is incomplete or unbalanced."
+            )
+
+        invalid_item = self._db.execute(
+            """SELECT i.sku
+               FROM inventory_items i
+               LEFT JOIN inventory_movements m ON m.item_id = i.id
+               GROUP BY i.id
+               HAVING i.on_hand_milli != COALESCE(SUM(
+                          CASE m.movement_type WHEN 'receipt' THEN m.quantity_milli
+                               WHEN 'issue' THEN -m.quantity_milli ELSE 0 END
+                      ), 0)
+                   OR i.value_minor != COALESCE(SUM(
+                          CASE m.movement_type WHEN 'receipt' THEN m.value_minor
+                               WHEN 'issue' THEN -m.value_minor ELSE 0 END
+                      ), 0)
+               LIMIT 1"""
+        ).fetchone()
+        if invalid_item is not None:
+            raise AccountingError(
+                f"Inventory balance does not match movement history for SKU {invalid_item['sku']}."
             )
 
     @staticmethod

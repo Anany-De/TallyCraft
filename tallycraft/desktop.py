@@ -151,6 +151,7 @@ class TallyCraftDesktop:
         for label, icon in (
             ("Overview", "⌂"),
             ("Accounts", "▤"),
+            ("Inventory", "▦"),
             ("Vouchers", "＋"),
             ("Reports", "▥"),
         ):
@@ -200,6 +201,12 @@ class TallyCraftDesktop:
             bg=COLORS["surface"], fg=COLORS["muted"], font=("Segoe UI", 9),
         )
         self.today_label.pack(side="right", padx=26)
+        self._button(topbar, "Export Excel", self.export_excel, secondary=True).pack(
+            side="right", padx=(0, 10)
+        )
+        self._button(topbar, "Import Excel", self.import_excel, secondary=True).pack(
+            side="right", padx=(0, 10)
+        )
         tk.Frame(self.content, height=1, bg=COLORS["border"]).pack(fill="x")
         self.page = tk.Frame(self.content, bg=COLORS["background"])
         self.page.pack(fill="both", expand=True, padx=27, pady=24)
@@ -315,6 +322,7 @@ class TallyCraftDesktop:
         {
             "Overview": self._show_overview,
             "Accounts": self._show_accounts,
+            "Inventory": self._show_inventory,
             "Vouchers": self._show_vouchers,
             "Reports": self._show_reports,
         }[name]()
@@ -322,6 +330,55 @@ class TallyCraftDesktop:
     def refresh(self) -> None:
         self._refresh_account_choices()
         self.show_view(self.active_view)
+
+    def export_excel(self) -> None:
+        path = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Export TallyCraft workbook",
+            defaultextension=".xlsx",
+            filetypes=(("Excel workbook", "*.xlsx"),),
+            initialfile=f"tallycraft-{date.today().isoformat()}.xlsx",
+        )
+        if not path:
+            return
+        try:
+            self.ledger.export_excel(path)
+        except (OSError, ValueError, ImportError) as error:
+            messagebox.showerror("Excel export failed", str(error), parent=self.root)
+            return
+        messagebox.showinfo(
+            "Workbook exported", f"Workbook saved to:\n{path}", parent=self.root
+        )
+
+    def import_excel(self) -> None:
+        path = filedialog.askopenfilename(
+            parent=self.root,
+            title="Import TallyCraft workbook",
+            filetypes=(("Excel workbook", "*.xlsx"),),
+        )
+        if not path:
+            return
+        if not messagebox.askyesno(
+            "Import workbook",
+            "Import accounts, journal vouchers, and inventory from this workbook?\n\n"
+            "The current book must have no journal entries or inventory items. "
+            "Matching accounts can be reused. The import is validated and applied "
+            "as one transaction.",
+            parent=self.root,
+        ):
+            return
+        try:
+            imported = self.ledger.import_excel(path)
+        except (OSError, ValueError, ImportError) as error:
+            messagebox.showerror("Excel import failed", str(error), parent=self.root)
+            return
+        self.refresh()
+        messagebox.showinfo(
+            "Workbook imported",
+            f"Imported {imported} journal vouchers. Account and inventory records "
+            "are now available in the book.",
+            parent=self.root,
+        )
 
     def _show_overview(self) -> None:
         self._page_heading(
@@ -419,6 +476,290 @@ class TallyCraftDesktop:
                 entry.entry_date.isoformat(), entry.memo, entry.reference or "—",
                 self._money(entry.amount),
             ))
+
+    def _show_inventory(self) -> None:
+        items = self.ledger.list_inventory_items()
+        low_stock_count = sum(
+            item.reorder_level > 0 and item.quantity_on_hand <= item.reorder_level
+            for item in items
+        )
+        self._page_heading(
+            "Inventory",
+            "Track stock quantities and moving-average cost alongside the general ledger.",
+            ("＋  Add item", self.add_inventory_item),
+        )
+        actions = tk.Frame(self.page, bg=COLORS["background"])
+        actions.pack(fill="x", pady=(0, 14))
+        self._button(
+            actions, "Receive stock", lambda: self.inventory_transaction(receive=True)
+        ).pack(side="left")
+        self._button(
+            actions, "Issue stock", lambda: self.inventory_transaction(receive=False),
+            secondary=True,
+        ).pack(side="left", padx=(8, 0))
+
+        section = self._section(
+            self.page,
+            "Stock on hand",
+            f"{len(items)} items · {low_stock_count} at or below reorder level",
+        )
+        tree = self._tree(
+            section,
+            (("sku", "SKU", 100), ("name", "ITEM", 230), ("unit", "UNIT", 75),
+             ("quantity", "ON HAND", 100), ("reorder", "REORDER AT", 105),
+             ("value", "CARRYING VALUE", 145), ("account", "CONTROL ACCOUNT", 155)),
+            height=9,
+        )
+        tree.pack(fill="x", padx=10, pady=(0, 12))
+        tree.tag_configure("low_stock", foreground=COLORS["negative"])
+        for item in items:
+            tree.insert(
+                "",
+                "end",
+                values=(
+                    item.sku,
+                    item.name,
+                    item.unit,
+                    str(item.quantity_on_hand),
+                    str(item.reorder_level),
+                    self._money(item.carrying_value),
+                    item.inventory_account_code,
+                ),
+                tags=("low_stock",)
+                if item.reorder_level > 0 and item.quantity_on_hand <= item.reorder_level
+                else (),
+            )
+        if not items:
+            tk.Label(
+                section,
+                text="No stock items yet. Add an item to start tracking inventory.",
+                bg=COLORS["surface"],
+                fg=COLORS["muted"],
+                font=("Segoe UI", 9),
+            ).pack(anchor="w", padx=18, pady=(0, 17))
+
+        movements = self._section(self.page, "Recent stock movements", "Receipts and issues")
+        history_tree = self._tree(
+            movements,
+            (("date", "DATE", 105), ("sku", "SKU", 90), ("name", "ITEM", 190),
+             ("movement", "TYPE", 85), ("quantity", "QUANTITY", 95),
+             ("value", "VALUE", 110), ("reference", "REFERENCE", 115),
+             ("memo", "DESCRIPTION", 190)),
+            height=5,
+        )
+        history_tree.pack(fill="x", padx=10, pady=(0, 12))
+        for movement in self.ledger.inventory_history(10):
+            history_tree.insert(
+                "",
+                "end",
+                values=(
+                    movement.entry_date.isoformat(),
+                    movement.sku,
+                    movement.item_name,
+                    movement.movement_type.title(),
+                    str(movement.quantity),
+                    self._money(movement.value),
+                    movement.reference or "—",
+                    movement.memo,
+                ),
+            )
+
+    def add_inventory_item(self) -> None:
+        accounts = self.ledger.list_accounts()
+        assets = [account for account in accounts if account.type == AccountType.ASSET]
+        expenses = [account for account in accounts if account.type == AccountType.EXPENSE]
+        if not assets or not expenses:
+            messagebox.showerror(
+                "Accounts needed",
+                "Create an asset account and an expense account before adding inventory.",
+                parent=self.root,
+            )
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Add inventory item")
+        dialog.configure(bg=COLORS["surface"])
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        frame = tk.Frame(dialog, bg=COLORS["surface"])
+        frame.pack(fill="both", padx=24, pady=20)
+        tk.Label(
+            frame,
+            text="Set up a stock item",
+            bg=COLORS["surface"],
+            fg=COLORS["ink"],
+            font=("Segoe UI Semibold", 15),
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 12))
+        sku = self._form_field(frame, "SKU / item code", 1, "e.g. ITEM-001")
+        name = self._form_field(frame, "Item name", 3, "e.g. Notebook")
+        unit = self._form_field(frame, "Unit of measure", 5, "e.g. pcs")
+        inventory_choice = ttk.Combobox(
+            frame,
+            state="readonly",
+            width=34,
+            values=[f"{account.code} · {account.name}" for account in assets],
+        )
+        preferred_asset = next(
+            (a for a in assets if a.name.casefold() == "inventory"), assets[0]
+        )
+        inventory_choice.set(f"{preferred_asset.code} · {preferred_asset.name}")
+        self._label(frame, "Inventory asset account").grid(
+            row=7, column=0, sticky="w", pady=(8, 3)
+        )
+        inventory_choice.grid(row=8, column=0, columnspan=2, sticky="ew", ipady=5)
+        cogs_choice = ttk.Combobox(
+            frame,
+            state="readonly",
+            width=34,
+            values=[f"{account.code} · {account.name}" for account in expenses],
+        )
+        preferred_cogs = next(
+            (a for a in expenses if a.name.casefold() == "cost of goods sold"),
+            expenses[0],
+        )
+        cogs_choice.set(f"{preferred_cogs.code} · {preferred_cogs.name}")
+        self._label(frame, "Cost of goods sold account").grid(
+            row=9, column=0, sticky="w", pady=(8, 3)
+        )
+        cogs_choice.grid(row=10, column=0, columnspan=2, sticky="ew", ipady=5)
+        reorder = self._form_field(frame, "Reorder alert at (quantity)", 11, "0")
+        buttons = tk.Frame(frame, bg=COLORS["surface"])
+        buttons.grid(row=13, column=0, columnspan=2, sticky="e", pady=(16, 0))
+        self._button(buttons, "Cancel", dialog.destroy, secondary=True).pack(
+            side="left", padx=5
+        )
+
+        def save_item() -> None:
+            try:
+                self.ledger.create_inventory_item(
+                    sku.get(),
+                    name.get(),
+                    unit.get(),
+                    inventory_choice.get().split(" · ", 1)[0],
+                    cogs_choice.get().split(" · ", 1)[0],
+                    reorder.get() or "0",
+                )
+            except (ValueError, TypeError) as error:
+                messagebox.showerror("Item not saved", str(error), parent=dialog)
+                return
+            dialog.destroy()
+            self.show_view("Inventory")
+
+        self._button(buttons, "Save item", save_item).pack(side="left", padx=5)
+        sku.focus_set()
+        self._center_dialog(dialog, 460, 540)
+
+    def inventory_transaction(self, receive: bool) -> None:
+        items = self.ledger.list_inventory_items()
+        if not items:
+            messagebox.showerror(
+                "Inventory item needed",
+                "Add an inventory item before recording a stock movement.",
+                parent=self.root,
+            )
+            return
+        dialog = tk.Toplevel(self.root)
+        title = "Receive stock" if receive else "Issue stock"
+        dialog.title(title)
+        dialog.configure(bg=COLORS["surface"])
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        frame = tk.Frame(dialog, bg=COLORS["surface"])
+        frame.pack(fill="both", padx=24, pady=20)
+        tk.Label(
+            frame, text=title, bg=COLORS["surface"], fg=COLORS["ink"],
+            font=("Segoe UI Semibold", 16),
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 12))
+        item_labels = {f"{item.sku} · {item.name}": item for item in items}
+        item_choice = ttk.Combobox(
+            frame, values=list(item_labels), state="readonly", width=36
+        )
+        item_choice.current(0)
+        self._label(frame, "Stock item").grid(
+            row=1, column=0, sticky="w", pady=(5, 3)
+        )
+        item_choice.grid(row=2, column=0, columnspan=2, sticky="ew", ipady=5)
+        date_entry = self._form_field(frame, "Movement date", 3, date.today().isoformat())
+        quantity = self._form_field(frame, "Quantity (up to 3 decimal places)", 5, "1")
+        unit_cost = None
+        offset_choice = None
+        if receive:
+            unit_cost = self._form_field(frame, "Unit cost", 7, "0.00")
+            self._label(frame, "Offset account (e.g. bank or accounts payable)").grid(
+                row=9, column=0, sticky="w", pady=(8, 3)
+            )
+            offset_choice = ttk.Combobox(frame, state="readonly", width=36)
+            offset_choice.grid(row=10, column=0, columnspan=2, sticky="ew", ipady=5)
+        else:
+            unit_cost = None
+        memo = self._form_field(frame, "Description", 11 if receive else 7, title)
+        reference = self._form_field(
+            frame, "Reference (optional)", 13 if receive else 9, "e.g. PO-1042"
+        )
+
+        def update_offset(*_args: object) -> None:
+            if offset_choice is None:
+                return
+            selected = item_labels.get(item_choice.get())
+            if selected is None:
+                offset_choice.configure(values=[])
+                return
+            options = [
+                account for account in self.ledger.list_accounts()
+                if account.code != selected.inventory_account_code
+            ]
+            labels = [f"{account.code} · {account.name}" for account in options]
+            offset_choice.configure(values=labels)
+            if labels:
+                offset_choice.set(labels[0])
+        item_choice.bind("<<ComboboxSelected>>", update_offset)
+        update_offset()
+        buttons = tk.Frame(frame, bg=COLORS["surface"])
+        buttons.grid(
+            row=15 if receive else 11,
+            column=0,
+            columnspan=2,
+            sticky="e",
+            pady=(16, 0),
+        )
+        self._button(buttons, "Cancel", dialog.destroy, secondary=True).pack(
+            side="left", padx=5
+        )
+
+        def post_movement() -> None:
+            item = item_labels.get(item_choice.get())
+            if item is None:
+                messagebox.showerror("Item required", "Select an inventory item.", parent=dialog)
+                return
+            try:
+                if receive:
+                    if offset_choice is None or not offset_choice.get():
+                        raise ValueError("Select an offset account.")
+                    self.ledger.receive_inventory(
+                        item.sku,
+                        date_entry.get(),
+                        quantity.get(),
+                        unit_cost.get() if unit_cost else "0",
+                        offset_choice.get().split(" · ", 1)[0],
+                        memo.get(),
+                        reference.get() or None,
+                    )
+                else:
+                    self.ledger.issue_inventory(
+                        item.sku, date_entry.get(), quantity.get(), memo.get(),
+                        reference.get() or None,
+                    )
+            except (ValueError, TypeError) as error:
+                messagebox.showerror("Stock movement not posted", str(error), parent=dialog)
+                return
+            dialog.destroy()
+            self.show_view("Inventory")
+
+        self._button(buttons, title, post_movement).pack(side="left", padx=5)
+        dialog.bind("<Return>", lambda _event: post_movement())
+        self._center_dialog(dialog, 490, 640 if receive else 525)
 
     def _show_reports(self) -> None:
         self._page_heading(

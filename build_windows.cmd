@@ -2,9 +2,9 @@
 setlocal
 cd /d "%~dp0"
 
-python -c "import PyInstaller" >nul 2>&1
+python -c "import PyInstaller, openpyxl" >nul 2>&1
 if errorlevel 1 (
-    echo PyInstaller is missing. Install it with:
+    echo Build dependencies are missing. Install them with:
     echo   python -m pip install -r requirements-build.txt
     exit /b 1
 )
