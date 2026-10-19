@@ -134,6 +134,76 @@ class LedgerTests(unittest.TestCase):
             [payload],
         )
 
+    def test_inventory_receipts_and_issues_use_moving_average_and_post_entries(self):
+        self.ledger.create_account("1200", "Inventory", AccountType.ASSET)
+        self.ledger.create_inventory_item(
+            "PEN-1", "Blue pen", "pcs", "1200", "5000", reorder_level="2"
+        )
+        self.ledger.receive_inventory(
+            "PEN-1", "2026-01-01", "10", "2.00", "3000", "Opening stock", "GRN-1"
+        )
+        self.ledger.receive_inventory(
+            "PEN-1", "2026-01-02", "10", "4.00", "3000", "Restock", "GRN-2"
+        )
+
+        item = self.ledger.list_inventory_items()[0]
+        self.assertEqual(item.quantity_on_hand, Decimal("20.000"))
+        self.assertEqual(item.carrying_value, Decimal("60.00"))
+        self.ledger.issue_inventory("PEN-1", "2026-01-03", "5", "Sale", "ISS-1")
+
+        item = self.ledger.list_inventory_items()[0]
+        self.assertEqual(item.quantity_on_hand, Decimal("15.000"))
+        self.assertEqual(item.carrying_value, Decimal("45.00"))
+        report = self.ledger.trial_balance("2026-01-03")
+        balances = {account.code: (debit, credit) for account, debit, credit in report.rows}
+        self.assertEqual(balances["1200"], (Decimal("45.00"), Decimal("0.00")))
+        self.assertEqual(balances["5000"], (Decimal("15.00"), Decimal("0.00")))
+        self.assertEqual(report.debit_total, report.credit_total)
+        history = self.ledger.inventory_history()
+        self.assertEqual([movement.movement_type for movement in history],
+                         ["issue", "receipt", "receipt"])
+        self.assertEqual(history[0].value, Decimal("15.00"))
+        self.ledger.verify_integrity()
+
+    def test_inventory_failures_do_not_change_stock_or_create_entries(self):
+        self.ledger.create_account("1200", "Inventory", AccountType.ASSET)
+        self.ledger.create_inventory_item(
+            "PEN-2", "Red pen", "pcs", "1200", "5000"
+        )
+        with self.assertRaisesRegex(AccountingError, "Unknown account"):
+            self.ledger.receive_inventory(
+                "PEN-2", "2026-01-01", "5", "1.00", "9999", "Invalid receipt"
+            )
+        self.assertEqual(self.ledger.inventory_history(), ())
+        self.assertEqual(self.ledger.journal_history(), ())
+        with self.assertRaisesRegex(AccountingError, "Insufficient stock"):
+            self.ledger.issue_inventory("PEN-2", "2026-01-02", "1", "Oversell")
+        self.assertEqual(self.ledger.inventory_history(), ())
+        self.assertEqual(self.ledger.journal_history(), ())
+
+    def test_inventory_integrity_check_detects_manual_balance_tampering(self):
+        self.ledger.create_account("1200", "Inventory", AccountType.ASSET)
+        self.ledger.create_inventory_item(
+            "PEN-3", "Green pen", "pcs", "1200", "5000"
+        )
+        self.ledger.receive_inventory(
+            "PEN-3", "2026-01-01", "3", "2.00", "3000", "Opening stock"
+        )
+        self.ledger.verify_integrity()
+
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute("DROP TRIGGER inventory_movements_immutable_update")
+            connection.execute(
+                "UPDATE inventory_items SET on_hand_milli = 2000 WHERE sku = 'PEN-3'"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        with self.assertRaisesRegex(AccountingError, "Inventory balance"):
+            self.ledger.verify_integrity()
+
 
 if __name__ == "__main__":
     unittest.main()
