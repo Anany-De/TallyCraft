@@ -28,7 +28,8 @@ third-party Python package is required.
   journal history.
 - **Reports:** date-based trial balance with CSV export.
 - **Ledger foundation:** exact-cent storage, balanced double-entry postings,
-  SQLite persistence, and append-only posted entries.
+  SQLite persistence, append-only posted entries, and a ledger/database
+  consistency check (`Ledger.verify_integrity()`).
 
 Create a journal voucher with **Ctrl+N** and refresh the current view with
 **F5**. Run tests with:
@@ -57,4 +58,7 @@ This is an early desktop MVP, not feature parity with TallyPrime. Inventory
 valuation, sales and purchase invoices, receivables/payables workflows,
 jurisdiction-specific tax compliance and filings, banking and reconciliation,
 payroll, multi-company and user access, and packaged installers remain future
-work.
+work. The integrity check detects SQLite consistency, foreign-key, and
+unbalanced/incomplete journal problems; it is not cryptographic tamper-proofing
+and cannot protect a database from someone who can replace or edit the local
+database file.

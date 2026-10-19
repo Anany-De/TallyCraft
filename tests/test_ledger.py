@@ -94,6 +94,46 @@ class LedgerTests(unittest.TestCase):
         with self.assertRaisesRegex(AccountingError, "positive integer"):
             self.ledger.journal_history(0)
 
+    def test_integrity_check_accepts_valid_ledger_and_detects_tampered_entry(self):
+        entry_id = self.ledger.post_entry(
+            "2026-01-01",
+            "Opening",
+            [EntryLine("1000", debit="25"), EntryLine("3000", credit="25")],
+        )
+        self.ledger.verify_integrity()
+
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute("DROP TRIGGER lines_immutable_update")
+            connection.execute(
+                """UPDATE journal_lines SET debit_minor = 2600
+                   WHERE entry_id = ? AND line_number = 1""",
+                (entry_id,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        with self.assertRaisesRegex(AccountingError, "incomplete or unbalanced"):
+            self.ledger.verify_integrity()
+
+    def test_sql_shaped_account_input_is_data_not_sql(self):
+        payload = "1000' OR 1=1 --"
+        self.ledger.create_account(payload, "Literal SQL-shaped code", AccountType.ASSET)
+        with self.assertRaisesRegex(AccountingError, "Unknown account"):
+            self.ledger.post_entry(
+                "2026-01-01",
+                "Injection probe",
+                [
+                    EntryLine(payload + "' OR '1'='1", debit="1"),
+                    EntryLine("3000", credit="1"),
+                ],
+            )
+        self.assertEqual(
+            [account.code for account in self.ledger.list_accounts() if account.code == payload],
+            [payload],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

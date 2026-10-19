@@ -239,6 +239,34 @@ class Ledger:
             for row in rows
         )
 
+    def verify_integrity(self) -> None:
+        """Raise if SQLite structure or posted double-entry records are inconsistent."""
+        result = self._db.execute("PRAGMA integrity_check").fetchone()[0]
+        if result != "ok":
+            raise AccountingError(f"Database integrity check failed: {result}")
+
+        foreign_key_error = self._db.execute("PRAGMA foreign_key_check").fetchone()
+        if foreign_key_error is not None:
+            raise AccountingError(
+                "Database contains a broken foreign-key reference "
+                f"in table {foreign_key_error['table']}."
+            )
+
+        invalid_entry = self._db.execute(
+            """SELECT je.id
+               FROM journal_entries je
+               LEFT JOIN journal_lines jl ON jl.entry_id = je.id
+               GROUP BY je.id
+               HAVING COUNT(jl.line_number) < 2
+                   OR COALESCE(SUM(jl.debit_minor), 0)
+                      != COALESCE(SUM(jl.credit_minor), 0)
+               LIMIT 1"""
+        ).fetchone()
+        if invalid_entry is not None:
+            raise AccountingError(
+                f"Journal entry {invalid_entry['id']} is incomplete or unbalanced."
+            )
+
     @staticmethod
     def _parse_date(value: date | str) -> date:
         if isinstance(value, datetime):
